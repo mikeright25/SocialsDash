@@ -14,7 +14,7 @@ import json
 import time
 import threading
 import webbrowser
-from datetime import datetime
+from datetime import datetime, timezone
 from flask import Flask, request, jsonify, render_template, Response
 import requests
 
@@ -40,6 +40,7 @@ FOLDERS_FILE = os.path.join(DATA_DIR, "folders.json")
 NOTES_FILE = os.path.join(DATA_DIR, "notes.json")
 
 os.makedirs(DATA_DIR, exist_ok=True)
+file_lock = threading.Lock()
 
 # Default Topic Folders
 DEFAULT_FOLDERS = [
@@ -69,23 +70,26 @@ def load_json(path, fallback):
         return fallback
 
 def save_json(path, data):
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        return True
-    except Exception as e:
-        print(f"Error saving {path}: {e}")
-        return False
+    with file_lock:
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            return True
+        except Exception as e:
+            print(f"Error saving {path}: {e}")
+            return False
 
 def get_reddit_credentials():
     """Retrieve credentials from config.json or environment variables."""
     cfg = load_json(CONFIG_FILE, {})
+    username = cfg.get("username") or os.environ.get("REDDIT_USERNAME", "")
+    default_ua = f"desktop:SocialsDash:1.0 (by /u/{username})" if username else "desktop:SocialsDash:1.0"
     return {
         "client_id": cfg.get("client_id") or os.environ.get("REDDIT_CLIENT_ID", ""),
         "client_secret": cfg.get("client_secret") or os.environ.get("REDDIT_CLIENT_SECRET", ""),
-        "username": cfg.get("username") or os.environ.get("REDDIT_USERNAME", ""),
+        "username": username,
         "password": cfg.get("password") or os.environ.get("REDDIT_PASSWORD", ""),
-        "user_agent": cfg.get("user_agent") or os.environ.get("REDDIT_USER_AGENT", "SocialsDash:1.0 (personal dashboard)")
+        "user_agent": cfg.get("user_agent") or os.environ.get("REDDIT_USER_AGENT", default_ua)
     }
 
 def get_access_token():
@@ -160,7 +164,7 @@ def configure_auth():
     if "client_secret" in data: cfg["client_secret"] = data["client_secret"].strip()
     if "username" in data: cfg["username"] = data["username"].strip()
     if "password" in data: cfg["password"] = data["password"].strip()
-    if "user_agent" in data: cfg["user_agent"] = data["user_agent"].strip() or f"SocialsDash:1.0 (by /u/{cfg.get('username')})"
+    if "user_agent" in data: cfg["user_agent"] = data["user_agent"].strip() or f"desktop:SocialsDash:1.0 (by /u/{cfg.get('username')})"
 
     save_json(CONFIG_FILE, cfg)
     token_cache["access_token"] = None  # Force re-auth
@@ -174,7 +178,7 @@ def configure_auth():
 
 @app.route("/api/saved/sync", methods=["POST"])
 def sync_saved_content():
-    """Fetch saved content via GET /user/username/saved and merge into local library."""
+    """Fetch saved content via GET /user/username/saved and merge into local library (with pagination)."""
     token, err = get_access_token()
     if not token:
         return jsonify({"success": False, "message": err}), 401
@@ -187,73 +191,85 @@ def sync_saved_content():
     }
 
     try:
-        # Fetch up to 100 recent saved items
-        url = f"https://oauth.reddit.com/user/{username}/saved?limit=100"
-        res = requests.get(url, headers=headers, timeout=12)
-
-        if res.status_code != 200:
-            return jsonify({"success": False, "message": f"Reddit API error ({res.status_code}): {res.text}"}), 400
-
-        data = res.json()
-        children = data.get("data", {}).get("children", [])
-
         current_saved = load_json(SAVED_FILE, [])
         saved_dict = {item["id"]: item for item in current_saved}
-
+        
         new_count = 0
-        for item in children:
-            kind = item.get("kind") # t3 = submission, t1 = comment
-            d = item.get("data", {})
-            item_id = d.get("id")
+        total_retrieved = 0
+        after_cursor = None
+        max_pages = 5  # Fetch up to 500 items per sync run to stay well within rate limits
 
-            if not item_id:
-                continue
+        for _ in range(max_pages):
+            url = f"https://oauth.reddit.com/user/{username}/saved?limit=100"
+            if after_cursor:
+                url += f"&after={after_cursor}"
 
-            is_comment = kind == "t1"
-            title = d.get("link_title", "") if is_comment else d.get("title", "")
-            body = d.get("body", "") if is_comment else (d.get("selftext", "") or d.get("url", ""))
+            res = requests.get(url, headers=headers, timeout=12)
+            if res.status_code != 200:
+                return jsonify({"success": False, "message": f"Reddit API error ({res.status_code}): {res.text}"}), 400
 
-            # Suggest folder based on subreddit
-            sub = d.get("subreddit", "").lower()
-            default_folder = "folder_general"
-            if sub in ["python", "programming", "webdev", "coding", "softwareengineering"]:
-                default_folder = "folder_tech"
-            elif sub in ["machinelearning", "localllama", "artificial", "openai", "claudeai"]:
-                default_folder = "folder_ai"
-            elif sub in ["productivity", "obsidianmd", "notion", "pkm", "gtd"]:
-                default_folder = "folder_productivity"
-            elif sub in ["ui_design", "web_design", "css", "frontend"]:
-                default_folder = "folder_design"
-            elif sub in ["depthhub", "truereddit", "philosophy", "books"]:
-                default_folder = "folder_essays"
+            data = res.json()
+            children = data.get("data", {}).get("children", [])
+            if not children:
+                break
 
-            if item_id in saved_dict:
-                # Keep user-customized local metadata
-                saved_dict[item_id]["score"] = d.get("score", saved_dict[item_id].get("score", 0))
-                saved_dict[item_id]["num_comments"] = d.get("num_comments", saved_dict[item_id].get("num_comments", 0))
-            else:
-                new_count += 1
-                saved_dict[item_id] = {
-                    "id": item_id,
-                    "fullname": d.get("name", f"{kind}_{item_id}"),
-                    "kind": kind,
-                    "title": title or "Untitled Saved Item",
-                    "author": d.get("author", "[deleted]"),
-                    "subreddit": d.get("subreddit", ""),
-                    "permalink": f"https://reddit.com{d.get('permalink', '')}",
-                    "url": d.get("url", ""),
-                    "body": body,
-                    "score": d.get("score", 0),
-                    "num_comments": d.get("num_comments", 0),
-                    "created_utc": d.get("created_utc", time.time()),
-                    "thumbnail": d.get("thumbnail", "") if not is_comment else "",
-                    "is_self": d.get("is_self", False),
-                    "folderId": default_folder,
-                    "tags": [d.get("subreddit", "")] if d.get("subreddit") else [],
-                    "status": "unread", # unread, reading, archived
-                    "isStarred": False,
-                    "syncedAt": datetime.utcnow().isoformat() + "Z"
-                }
+            total_retrieved += len(children)
+            for item in children:
+                kind = item.get("kind")
+                d = item.get("data", {})
+                item_id = d.get("id")
+
+                if not item_id:
+                    continue
+
+                is_comment = kind == "t1"
+                title = d.get("link_title", "") if is_comment else d.get("title", "")
+                body = d.get("body", "") if is_comment else (d.get("selftext", "") or d.get("url", ""))
+
+                sub = d.get("subreddit", "").lower()
+                default_folder = "folder_general"
+                if sub in ["python", "programming", "webdev", "coding", "softwareengineering"]:
+                    default_folder = "folder_tech"
+                elif sub in ["machinelearning", "localllama", "artificial", "openai", "claudeai"]:
+                    default_folder = "folder_ai"
+                elif sub in ["productivity", "obsidianmd", "notion", "pkm", "gtd"]:
+                    default_folder = "folder_productivity"
+                elif sub in ["ui_design", "web_design", "css", "frontend"]:
+                    default_folder = "folder_design"
+                elif sub in ["depthhub", "truereddit", "philosophy", "books"]:
+                    default_folder = "folder_essays"
+
+                if item_id in saved_dict:
+                    saved_dict[item_id]["score"] = d.get("score", saved_dict[item_id].get("score", 0))
+                    saved_dict[item_id]["num_comments"] = d.get("num_comments", saved_dict[item_id].get("num_comments", 0))
+                else:
+                    new_count += 1
+                    saved_dict[item_id] = {
+                        "id": item_id,
+                        "fullname": d.get("name", f"{kind}_{item_id}"),
+                        "kind": kind,
+                        "title": title or "Untitled Saved Item",
+                        "author": d.get("author", "[deleted]"),
+                        "subreddit": d.get("subreddit", ""),
+                        "permalink": f"https://reddit.com{d.get('permalink', '')}",
+                        "url": d.get("url", ""),
+                        "body": body,
+                        "score": d.get("score", 0),
+                        "num_comments": d.get("num_comments", 0),
+                        "created_utc": d.get("created_utc", time.time()),
+                        "thumbnail": d.get("thumbnail", "") if not is_comment else "",
+                        "is_self": d.get("is_self", False),
+                        "folderId": default_folder,
+                        "tags": [d.get("subreddit", "")] if d.get("subreddit") else [],
+                        "status": "unread",
+                        "isStarred": False,
+                        "syncedAt": datetime.now(timezone.utc).isoformat()
+                    }
+
+            after_cursor = data.get("data", {}).get("after")
+            if not after_cursor:
+                break
+            time.sleep(0.5)  # Graceful delay between pagination calls
 
         merged_saved = list(saved_dict.values())
         merged_saved.sort(key=lambda x: x.get("created_utc", 0), reverse=True)
@@ -261,7 +277,7 @@ def sync_saved_content():
 
         return jsonify({
             "success": True,
-            "message": f"Sync complete! Retrieved {len(children)} items ({new_count} new).",
+            "message": f"Sync complete! Retrieved {total_retrieved} items ({new_count} new).",
             "total": len(merged_saved),
             "new": new_count
         })
@@ -399,10 +415,9 @@ def get_aggregated_feed():
     }
 
     subreddit = request.args.get("subreddit", "").strip()
-    sort_mode = request.args.get("sort", "hot") # hot, new, top
+    sort_mode = request.args.get("sort", "hot")
 
     try:
-        # If specific subreddit requested, fetch r/{sub}/{sort}. Otherwise fetch personalized frontpage /hot
         endpoint = f"https://oauth.reddit.com/r/{subreddit}/{sort_mode}?limit=35" if subreddit else f"https://oauth.reddit.com/{sort_mode}?limit=35"
         res = requests.get(endpoint, headers=headers, timeout=12)
 
@@ -415,7 +430,6 @@ def get_aggregated_feed():
         feed_items = []
         for c in children:
             d = c.get("data", {})
-            # Filter out promoted / stickied ads
             if d.get("promoted", False):
                 continue
 
@@ -448,7 +462,6 @@ def get_folders():
     folders = load_json(FOLDERS_FILE, DEFAULT_FOLDERS)
     saved_items = load_json(SAVED_FILE, [])
 
-    # Calculate item count per folder
     counts = {}
     for it in saved_items:
         fid = it.get("folderId", "folder_general")
@@ -484,7 +497,7 @@ def create_folder():
 def export_library():
     export_data = {
         "version": "1.0.0",
-        "exportedAt": datetime.utcnow().isoformat() + "Z",
+        "exportedAt": datetime.now(timezone.utc).isoformat(),
         "saved_content": load_json(SAVED_FILE, []),
         "folders": load_json(FOLDERS_FILE, DEFAULT_FOLDERS),
         "subreddits": load_json(SUBREDDITS_FILE, [])
